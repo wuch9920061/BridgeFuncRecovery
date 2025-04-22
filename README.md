@@ -20,4 +20,4 @@ After running all cells in *main_RunAnalysis.ipynb*, a pickle file *Results.pkl*
 
 
 ### User-specified inputs
-
+All used-specified inputs should be provided by adjusting paramters  under the second cell (i.e., under the cell right below the markdown ##User Inputs) before running all follow-up cells to perform the analysis. 
