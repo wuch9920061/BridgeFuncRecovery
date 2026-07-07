@@ -5,6 +5,240 @@ from scipy.stats import lognorm
 import pandas as pd
 import math
 from collections import Counter
+import pickle
+
+def build_bridge_class(
+    design_era,
+    num_span,
+    num_cols_per_bent=None,
+    column_shape=None,
+    abutment_type=None
+):
+    """
+    Build bridge class tag such as 'E3-S3P-C3P-O-S'.
+
+    design_era: 'E1', 'E2', 'E3'
+    num_span: integer
+    num_cols_per_bent: integer, required if num_span > 1
+    column_shape: 'O', 'C', 'R', required if num_span > 1
+    abutment_type: 'D' or 'S'
+    """
+
+    if design_era not in ["E1", "E2", "E3"]:
+        raise ValueError("design_era must be one of ['E1', 'E2', 'E3'].")
+
+    if abutment_type not in ["D", "S"]:
+        raise ValueError("abutment_type must be 'D' for diaphragm or 'S' for seat.")
+
+    if num_span == 1:
+        span_class = "S1"
+        bent_type = "NA"
+        col_shape = "NA"
+
+    elif num_span == 2:
+        span_class = "S2"
+
+        if num_cols_per_bent is None:
+            raise ValueError("num_cols_per_bent is required when num_span > 1.")
+        if column_shape not in ["O", "C", "R"]:
+            raise ValueError("column_shape must be one of ['O', 'C', 'R'] when num_span > 1.")
+
+        bent_type = "C1" if num_cols_per_bent == 1 else "C2" if num_cols_per_bent == 2 else "C3P"
+        col_shape = column_shape
+
+    elif num_span > 2:
+        span_class = "S3P"
+
+        if num_cols_per_bent is None:
+            raise ValueError("num_cols_per_bent is required when num_span > 1.")
+        if column_shape not in ["O", "C", "R"]:
+            raise ValueError("column_shape must be one of ['O', 'C', 'R'] when num_span > 1.")
+
+        bent_type = "C1" if num_cols_per_bent == 1 else "C2" if num_cols_per_bent == 2 else "C3P"
+        col_shape = column_shape
+
+    else:
+        raise ValueError("num_span must be a positive integer.")
+
+    bridge_class = f"{design_era}-{span_class}-{bent_type}-{col_shape}-{abutment_type}"
+    return bridge_class
+
+def assign_fragility_by_bridge_class(
+    bridge_class,
+    FRA_LIB,
+    include_super_location_components=True
+):
+    """
+    Retrieve fragility functions from FRA_LIB and convert them into the current
+    CompFra_dict format used by sample_damage_correlated_baker().
+
+    Output format:
+        CompFra_dict = {'CompFra': {...}}
+    """
+
+    fra_raw = FRA_LIB[bridge_class]
+    CompModelFra = dict(fra_raw)
+
+    # ------------------------------------------------------------
+    # Incorporation of fragilities for in-span seat, bent bearing, bent shear key, and in-span seal
+    # If current bridge is diaphragm type (*-D), retrieve these from
+    # the corresponding seat-abutment class (*-S).
+    # ------------------------------------------------------------
+    if include_super_location_components:
+        parts = bridge_class.split("-")
+        abutment_type = parts[-1]
+
+        if abutment_type == "D":
+            bridge_class_super = "-".join(parts[:-1] + ["S"])
+            fra_super = FRA_LIB[bridge_class_super]
+
+        else:
+            fra_super = fra_raw
+
+        super_model_map = {
+            "Unseating": "Seat_super",
+            "Bearing": "Bearing_super",
+            "Key": "Key_super",
+            "Seal": "JointSeal_super",
+        }
+
+        for old_name, new_name in super_model_map.items():
+            if old_name in fra_super:
+                CompModelFra[new_name] = fra_super[old_name]
+
+    return {"CompFra": CompModelFra}
+
+def build_component_quantity(
+    bridge_class,
+    num_span,
+    num_cols_per_bent=None,
+    has_super_location_components=False
+):
+    """
+    Build CompQty dictionary from bridge class and bridge geometry.
+
+    Parameters
+    ----------
+    bridge_class : str
+        Bridge class tag, e.g. 'E3-S3P-C3P-O-S'.
+
+    num_span : int
+        Number of spans.
+
+    num_cols_per_bent : int or None
+        Number of columns per bent. Required if num_span > 1.
+
+    has_super_location_components : bool
+        True if Seat_super, Bearing_super, Key_super, and JointSeal_super
+        are included at superstructure location.
+
+    Returns
+    -------
+    CompQty : dict
+    """
+
+    parts = bridge_class.split("-")
+
+    if len(parts) != 5:
+        raise ValueError(f"Invalid bridge_class: {bridge_class}")
+
+    _, span_class, bent_class, _, abut_type = parts
+
+    # -----------------------------
+    # Check span consistency
+    # -----------------------------
+    if num_span < 1:
+        raise ValueError("num_span must be >= 1.")
+
+    if span_class == "S1" and num_span != 1:
+        raise ValueError("bridge_class says S1, but num_span is not 1.")
+
+    if span_class == "S2" and num_span != 2:
+        raise ValueError("bridge_class says S2, but num_span is not 2.")
+
+    if span_class == "S3P" and num_span <= 2:
+        raise ValueError("bridge_class says S3P, but num_span is not > 2.")
+
+    # -----------------------------
+    # Column / bent consistency
+    # -----------------------------
+    if num_span == 1:
+        expected_num_cols_per_bent = 0
+
+        if bent_class != "NA":
+            raise ValueError("Single-span bridge should have bent_class = 'NA'.")
+
+    else:
+        if num_cols_per_bent is None:
+            raise ValueError("num_cols_per_bent is required when num_span > 1.")
+
+        if num_cols_per_bent < 1:
+            raise ValueError("num_cols_per_bent must be >= 1 when num_span > 1.")
+
+        if bent_class == "C1" and num_cols_per_bent != 1:
+            raise ValueError("bridge_class says C1, but num_cols_per_bent is not 1.")
+
+        if bent_class == "C2" and num_cols_per_bent != 2:
+            raise ValueError("bridge_class says C2, but num_cols_per_bent is not 2.")
+
+        if bent_class == "C3P" and num_cols_per_bent <= 2:
+            raise ValueError("bridge_class says C3P, but num_cols_per_bent is not > 2.")
+
+        expected_num_cols_per_bent = num_cols_per_bent
+
+    num_bents = max(num_span - 1, 0)
+    num_columns = num_bents * expected_num_cols_per_bent
+
+    # -----------------------------
+    # Abutment components
+    # -----------------------------
+    if abut_type == "S":
+        seat_ab_qty = 2
+        bearing_ab_qty = 2
+        key_ab_qty = 2
+        jointseal_ab_qty = 2
+
+    elif abut_type == "D":
+        seat_ab_qty = 0
+        bearing_ab_qty = 0
+        key_ab_qty = 0
+        jointseal_ab_qty = 0
+
+    else:
+        raise ValueError("abut_type must be 'S' or 'D'.")
+
+    # -----------------------------
+    # Super-location components
+    # -----------------------------
+    if has_super_location_components:
+        seat_super_qty = num_bents
+        bearing_super_qty = num_bents
+        key_super_qty = num_bents
+        jointseal_super_qty = num_bents
+    else:
+        seat_super_qty = 0
+        bearing_super_qty = 0
+        key_super_qty = 0
+        jointseal_super_qty = 0
+
+    CompQty = {
+        "Col": int(num_columns),
+        "Seat_ab": int(seat_ab_qty),
+        "Super": int(num_span),
+        "ColFnd": int(num_columns),
+        "AbFnd": 2,
+        "Backwall": 2,
+        "Bearing_ab": int(bearing_ab_qty),
+        "Key_ab": int(key_ab_qty),
+        "ApproSlab": 2,
+        "JointSeal_ab": int(jointseal_ab_qty),
+        "Seat_super": int(seat_super_qty),
+        "Bearing_super": int(bearing_super_qty),
+        "Key_super": int(key_super_qty),
+        "JointSeal_super": int(jointseal_super_qty),
+    }
+
+    return CompQty
 
 def sample_damage_InverseTrams(IM_evaluated, CompName, CompFra_dict_input):
     # Return a component damage state (discrete) based on provided IM and componentModelname
@@ -49,8 +283,6 @@ def sample_damage_correlated_baker(IM_fixed_input, CompModelName_List_input, Com
                                     IntraGroupRule_input, CompFra_dict_input, 
                                    correlation_weight_input, num_rlz_input):
     # Return a component damage state (discrete) based on provided IM and componentModelname
-    random.seed(1223)
-    np.random.seed(1223)
 
     #------------Input-----------------------------
     # IM_fixed: scalar
@@ -278,9 +510,6 @@ def sample_order_IF(sysDS_rlz_input, Impeding_dataset_input, emergency_protocol_
     IF_sampled_list_output = {key: [None]*len(sysDS_rlz_input) for key in Impeding_dataset_input[1]}
     IF_sum_list_output = [None]*len(sysDS_rlz_input)
 
-    random.seed(1223)
-    np.random.seed(1223)
-
     for SysDS_idx, SysDS in enumerate(sysDS_rlz_input):
         if SysDS not in range(0,5):
             raise ValueError("SysDS not in [0,4]")
@@ -320,9 +549,6 @@ def sample_order_IF(sysDS_rlz_input, Impeding_dataset_input, emergency_protocol_
     IF_sampled_list_output = {key: [None]*len(sysDS_rlz_input) for key in Impeding_dataset_input.keys()}
     IF_sum_list_output = [None]*len(sysDS_rlz_input)
 
-    random.seed(1223)
-    np.random.seed(1223)
-
     for SysDS_idx, SysDS in enumerate(sysDS_rlz_input):
         if SysDS not in range(0,5):
             raise ValueError("SysDS not in [0,4]")
@@ -331,23 +557,27 @@ def sample_order_IF(sysDS_rlz_input, Impeding_dataset_input, emergency_protocol_
             for IFName,_ in Impeding_dataset_input.items():
                 IF_sampled_list_output[IFName][SysDS_idx] = 0
         else:    
-            #Sampling individual impeding factors 
-            for IFName,bounds_list in Impeding_dataset_input.items():
-                # EP not triggered, not affect functionality 
-                if SysDS in [0,1] and emergency_protocol_flag_input[SysDS_idx]!=1:
-                    lower_bound, upper_bound = bounds_list[0]
-                #EP not triggered, affect functionality
-                elif SysDS in [2,3,4] and emergency_protocol_flag_input[SysDS_idx]!=1:
-                    lower_bound, upper_bound = bounds_list[1]
-                #EP triggered, bridge not in complete DS
-                elif SysDS in [2,3] and emergency_protocol_flag_input[SysDS_idx]==1:
-                    lower_bound, upper_bound = bounds_list[2]
-                # EP triggered, bridge in complete DS
-                elif SysDS ==4 and emergency_protocol_flag_input[SysDS_idx]==1:
-                    lower_bound, upper_bound = bounds_list[3]
+            # Sampling individual impeding factors
+            for IFName, bounds_list in Impeding_dataset_input.items():
 
-                IF_sampled_list_output[IFName][SysDS_idx] = random.uniform(lower_bound, upper_bound)
+                if emergency_protocol_flag_input[SysDS_idx] != 1:
+                    if SysDS in [0, 1]:
+                        lower_bound, upper_bound = bounds_list[0]
+                    elif SysDS in [2, 3, 4]:
+                        lower_bound, upper_bound = bounds_list[1]
 
+                else:
+                    if SysDS == 1:
+                        # Emergency protocol does not change the IF bounds for slight damage
+                        lower_bound, upper_bound = bounds_list[0]
+                    elif SysDS in [2, 3]:
+                        lower_bound, upper_bound = bounds_list[2]
+                    elif SysDS == 4:
+                        lower_bound, upper_bound = bounds_list[3]
+
+                IF_sampled_list_output[IFName][SysDS_idx] = random.uniform(
+                    lower_bound,upper_bound)
+                
             # The triggering probability of permitting is 30%
             if (np.random.uniform(0, 1) > .3):
                 IF_sampled_list_output['Permitting'][SysDS_idx] = 0
@@ -361,7 +591,7 @@ def sample_order_IF(sysDS_rlz_input, Impeding_dataset_input, emergency_protocol_
             if (np.random.uniform(0, 1) > threshold):
                 IF_sampled_list_output['InDepInsp'][SysDS_idx] = 0
 
-            #Order the sampled impeding factors and calculate the sum
+            # Order the sampled impeding factors and calculate the sum
             if emergency_protocol_flag_input[SysDS_idx]!=1: # Sequencing under non-emergency response
                 IF_sum_list_output[SysDS_idx] = IF_sampled_list_output['IniInsp'][SysDS_idx] + \
                 IF_sampled_list_output['InDepInsp'][SysDS_idx]+\
@@ -380,11 +610,9 @@ def sample_replacementdur(Worker_Replace_input,repldur_min_input,repldur_max_inp
                           num_concrete_pour_input, # each concrete pout corresponding to an addition of a 28-day curing time
                           dispersion_assigned_scalar):
     
-    random.seed(1223)
-    np.random.seed(1223)
    
     # Interpolate the median dur for the bridge replacement
-    if Worker_Replace_input< replworker_min_input: raise ValueError("The provided worker number does not satisfy the minimum req");
+    if Worker_Replace_input< replworker_min_input: raise ValueError(f"The provided worker number for replacement ({Worker_Replace_input}) does not satisfy the minimum req which is {replworker_min_input}");
     elif Worker_Replace_input>= replworker_max_input: med_repl_dur = repldur_min_input;
     else: med_repl_dur = np.interp(Worker_Replace_input, [replworker_min_input, replworker_max_input], [repldur_max_input, repldur_min_input])
 
@@ -565,28 +793,6 @@ def sample_comp_repairdur(DS_comp_rlz,RepDur_comp_dict_input, RepDur_WorkerBound
     
     return RepDur_sampled_dict
 
-'''
-def order_comp_repairdur_old(RepDur_sampled_dict,abut_type_string):
-    repdur_sum = None
-    
-    if abut_type_string not in ['Seat','Diaphragm']:
-        raise ValueError("abut_type not in Seat or Diaphragm")
-
-    elif abut_type_string == 'Seat':           
-        dur_seq1 = RepDur_sampled_dict['Fnd'] + RepDur_sampled_dict['Col'] +RepDur_sampled_dict['Super']
-        dur_seq3 = RepDur_sampled_dict['AbPile'] + RepDur_sampled_dict['Seat'] + \
-            max(RepDur_sampled_dict['Backwall'] , RepDur_sampled_dict['Key'] , RepDur_sampled_dict['Bearing']) + \
-            RepDur_sampled_dict['ApproSlab'] + RepDur_sampled_dict['JointSeal']
-        repdur_sum = max(dur_seq1,dur_seq3)
-    
-    #elif abut_type_string == 'Diaphragm':   
-    #    dur_seq1 = RepDur_sampled_dict['Fnd'] + RepDur_sampled_dict['Col'] +RepDur_sampled_dict['Super']
-    #    dur_seq2 = RepDur_sampled_dict['ApproSlab']
-    #    dur_seq3 = RepDur_sampled_dict['AbPile'] +  RepDur_sampled_dict['Backwall']
-    
-    return repdur_sum
-'''
-
 def order_comp_repairdur(RepDur_sampled_dict,CompName_List_input):
     repdur_sum = None
 
@@ -614,77 +820,55 @@ def order_comp_repairdur(RepDur_sampled_dict,CompName_List_input):
     
     return repdur_sum
 
+def assign_replacement_duration_bounds(
+    num_span,
+    height,
+    RepDur_bridge_singlespan,
+    RepDur_bridge_singlespan_WorkerBound,
+    RepDur_bridge_twospan,
+    RepDur_bridge_twospan_WorkerBound,
+    RepDur_bridge_multispan_l30,
+    RepDur_bridge_multispan_l30_WorkerBound,
+    RepDur_bridge_multispan_g30_l100,
+    RepDur_bridge_multispan_g30_l100_WorkerBound,
+    RepDur_bridge_multispan_g100,
+    RepDur_bridge_multispan_g100_WorkerBound,
+):
+    """
+    Assign bridge replacement duration and worker bounds
+    based on number of spans and bridge height.
+    """
 
-'''
-def decisiontree_reopeningFS_old(RC_comp_this, RepDur_sampled_this, abut_type_string, FS_rlz_this,
-                              DecTreeProb_SuperAppro_input = [.2,.1,.7], DecTreeProb_AbutRelated_input = [.6,.2,.2]):
-    # RC_comp_this: a dict of mapped repair class per rlz (i.e., a column in 'RepairCalss_dict'). 
-    # RepDur_sampled_this: a dict of sampled rep duration per rlz from 'RepDur_sampled_comp_rlz'
-    # Return: a scalar RFS tag
-    if abut_type_string not in ['Seat','Diaphragm']:
-        raise ValueError("abut_type not in Seat or Diaphragm")
+    if num_span < 1:
+        raise ValueError("num_span must be >= 1.")
 
-    elif RepDur_sampled_this == 'Complete':
-        return FS_rlz_this #return RFS5 - Maintain the Previous Closure Decision
-        #print("Since bridge is in complete DS, return previous closure decision")
+    if height <= 0:
+        raise ValueError("height must be positive.")
 
-    elif abut_type_string == 'Seat':     
-        # Create a Remaining Secondary Component list that are repaired after primary componens are repaired
-        RemCompList = ['Super','Backwall','Bearing','Key']
-        if RepDur_sampled_this['JointSeal'] > RepDur_sampled_this['Seat']:
-            RemCompList.append('JointSeal')
-        if RepDur_sampled_this['ApproSlab'] > RepDur_sampled_this['Seat']:
-            RemCompList.append('ApproSlab')
-        #print(RemCompList)
+    if num_span == 1:
+        repla_durbound = RepDur_bridge_singlespan
+        repla_workerbound = RepDur_bridge_singlespan_WorkerBound
 
-        # -- ANY primary component in RC=5 or ALL primary components in RC = 1 or 2, Maintain the Previous Closure Decision
-        if (any(rc_val in [5] for rc_val in [RC_comp_this['Col'], RC_comp_this['Seat']]) ) or (all(rc_val in [1,2] for rc_val in [RC_comp_this['Col'], RC_comp_this['Seat']])):
-            #print("all components in RC5 or any remaining secondary component in RC1 or 2, return previous closure decision")
-            return FS_rlz_this #return: Maintain the Previous Closure Decision
-        # all RCs for the remaining second. componts are in RC1 assign - FS1: Fully Repaired
-        elif (all(RC_comp_this.get(RemCompName) in [1] for RemCompName in RemCompList)): 
-            #print("remaining second. componts are in RC1 , return FS=1")
-            return 0 #return FS0: Fully Repaired
-        elif (all(RC_comp_this.get(RemCompName) in [1,2] for RemCompName in RemCompList)): 
-            #print("remaining second. componts are in RC2 , return FS=2")
-            return 1 #return FS1: Fully Functional
-        # if Super OR ApproSlab in RC3 
-        elif (any(RC_comp_this.get(RemCompName) in [3] for RemCompName in ['Super','ApproSlab'])):
-            #print(" Super OR ApproSlab in RC3 ")
-            return(np.random.choice([4,5,6], size=1, p=DecTreeProb_SuperAppro_input)[0]) # return: either one in FS4 - Reopen with Weight Restriction, FS5: Reopen with Minor Lane Closure, and FS6: Reopen with Weight Restrictions and Minor Lane Closure
-        #if any abut-related comp in RC3
-        elif (any(RC_comp_this.get(RemCompName) in [3] for RemCompName in ['Backwall','Bearing','Key','JointSeal'])):
-            #print(" any abut-related comp in RC3 ")
-            return(np.random.choice([4,5,6], size=1, p=DecTreeProb_AbutRelated_input)[0])
-        else:
-            raise ValueError("There's some event not considered in this function")
+    elif num_span == 2:
+        repla_durbound = RepDur_bridge_twospan
+        repla_workerbound = RepDur_bridge_twospan_WorkerBound
 
-    elif abut_type_string == 'Diaphragm':   
-        RemCompList = ['Super']
-        if RepDur_sampled_this['ApproSlab'] > RepDur_sampled_this['Col']:
-            RemCompList.append('ApproSlab')
-        if RepDur_sampled_this['Backwall'] > RepDur_sampled_this['Col']:
-            RemCompList.append('Backwall')
-        #print(RemCompList)
+    elif height <= 30:
+        repla_durbound = RepDur_bridge_multispan_l30
+        repla_workerbound = RepDur_bridge_multispan_l30_WorkerBound
 
-         # -- if ANY primary component in RC=5 or ALL primary components in RC = 1 or 2
-        if (any(rc_val in [5] for rc_val in [RC_comp_this['Col']]) )or (all(rc_val in [1,2] for rc_val in [RC_comp_this['Col']])):
-            return FS_rlz_this #Maintain the Previous Closure Decision
-        # all RCs for the remaining second. componts are in RC1 assign - FS1: Fully Repaired
-        elif (all(RC_comp_this.get(RemCompName) in [1] for RemCompName in RemCompList)): 
-            return 0 #return FS0: Fully Repaired
-        # all RCs for the remaining second. componts are in RC2 assign - FS2: Fully Functional
-        elif (all(RC_comp_this.get(RemCompName) in [1,2] for RemCompName in RemCompList)): 
-            return 1 #return FS1: Fully Functional
-        # if Super OR ApproSlab in RC3 
-        elif (any(RC_comp_this.get(RemCompName) in [3] for RemCompName in ['Super','ApproSlab'])): 
-            return(np.random.choice([4,5,6], size=1, p=DecTreeProb_SuperAppro_input)[0])
-        #if any abut-related comp in RC3
-        elif (any(RC_comp_this.get(RemCompName) in [3] for RemCompName in ['Backwall'])): 
-            return(np.random.choice([4,5,6], size=1, p=DecTreeProb_AbutRelated_input)[0])
-        else:
-            raise ValueError("There's some event not considered in this function")   
-'''
+    elif height <= 100:
+        repla_durbound = RepDur_bridge_multispan_g30_l100
+        repla_workerbound = RepDur_bridge_multispan_g30_l100_WorkerBound
+
+    else:
+        repla_durbound = RepDur_bridge_multispan_g100
+        repla_workerbound = RepDur_bridge_multispan_g100_WorkerBound
+
+    repldur_min, repldur_max = repla_durbound
+    replworker_max, replworker_min = repla_workerbound
+
+    return repldur_min, repldur_max, replworker_max, replworker_min
 
 def decisiontree_reopeningFS(RC_comp_this, RepDur_sampled_this, FS_rlz_this,
                               DecTreeProb_SuperAppro_input = [.2,.1,.7], DecTreeProb_AbutRelated_input = [.6,.2,.2]):
@@ -693,8 +877,6 @@ def decisiontree_reopeningFS(RC_comp_this, RepDur_sampled_this, FS_rlz_this,
     #-Output:
     # FS_rlz_this: a scalar of functionality state at the reopning phase
     # ReopeningTriggeringFlag: whether the Reopening phase is triggered or not
-    random.seed(1223)
-    np.random.seed(1223)
 
     primary_comp_names = ['Col', 'Seat_ab', 'Seat_super']
     RC_primarycomp_this = {key: RC_comp_this[key] for key in RC_comp_this.keys() if key in primary_comp_names}
@@ -785,8 +967,7 @@ def sample_closedlanenum(Stage_string, FS_rlz_scalar, lane_before,
     #- output
     #  a scalar of closed lane number
     #  (for reopening phase only), a tag indicating whether weight restriction is triggered
-    random.seed(1223)
-    np.random.seed(1223)
+
 
     if FS_rlz_scalar not in range(0,8):
         raise ValueError("FS_rlz_scalar must be in between [0,7]")
