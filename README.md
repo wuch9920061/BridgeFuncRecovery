@@ -9,7 +9,7 @@ Python: version 3.6 or above.
 Necessary Python packages: copy, numpy, pandas, os, scipy, sys, shutil, pathlib, re, time, pickle
 
 ### Workflow
-This framework estimates the recovery process of an individual bridge subjected to a specified earthquake intensity measure (IM) which currently only support spectral acceraltion at 1s ($Sa(1s)$). For each Monte Carlo realization, the workflow:
+This framework estimates the recovery process of an individual bridge subjected to a specified earthquake intensity measure (IM) which currently only support spectral acceraltion at 1s (Sa(1s)). For each Monte Carlo realization, the workflow:
 
 1. Samples correlated component damage states using bridge-specific fragility functions.
 2. Determines bridge-level repair class and system damage state.
